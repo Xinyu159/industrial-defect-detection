@@ -12,6 +12,11 @@ data/
 results/
 *.log
 
+# ---- Python venv / analysis scripts ----
+.venv/
+__pycache__/
+*.pyc
+
 # ---- IDE / OS ----
 .vscode/
 .idea/
