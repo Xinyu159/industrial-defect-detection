@@ -15,6 +15,7 @@ add_executable(defect_detector
     src/preprocess.cpp
     src/segmentation.cpp
     src/visualize.cpp
+    src/image_features.cpp
 )
 
 target_include_directories(defect_detector PRIVATE include)

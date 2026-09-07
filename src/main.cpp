@@ -9,6 +9,10 @@
 //        ground truth lives in scripts/batch_hitrate.py -- the C++ core only
 //        produces masks, a separate validation tool judges them. A single
 //        image that fails to load is skipped, the rest still runs.
+//   defect_detector features   <list.txt> <out.csv>    -- stage3: per image
+//        feature vector (gray stats + GLCM texture + mask shapes), one CSV
+//        row each. Training/judging lives in Python (scripts/train_classify.py);
+//        the C++ side stays a reusable feature pipeline.
 //
 // Stage-1 chain (why this order matters):
 //   1) toGray     -- NEU images are 3-channel JPEG but semantically gray
@@ -24,8 +28,10 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <opencv2/core.hpp>
@@ -33,6 +39,7 @@
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 
+#include "image_features.h"
 #include "preprocess.h"
 #include "segmentation.h"
 #include "visualize.h"
@@ -48,7 +55,8 @@ void usage(const char* argv0) {
               << "  " << argv0 << " preprocess <input_image> <out_prefix>\n"
               << "  " << argv0 << " segment    <input_image> <out_prefix> "
                  "[otsu|edge|hat|all]\n"
-              << "  " << argv0 << " batch      <image_list.txt> <out_dir>\n";
+              << "  " << argv0 << " batch      <image_list.txt> <out_dir>\n"
+              << "  " << argv0 << " features   <image_list.txt> <out.csv>\n";
 }
 
 // min / mean / max / std of an 8-bit gray image -- numeric evidence that a
@@ -127,12 +135,32 @@ int runSegment(const std::string& in_path, const std::string& prefix,
     return 0;
 }
 
+// Run the three stage-2 strategies on a gray image and clean each mask with
+// the same morphologyClean(3,5) as `segment`. Shared by `batch` and
+// `features` so every consumer sees identical masks.
+std::vector<std::pair<std::string, cv::Mat>> segmentAllMasks(const cv::Mat& gray) {
+    struct Run {
+        const char* tag;
+        cv::Mat (*make)(const cv::Mat&);
+    };
+    static const Run kRuns[] = {
+        {"otsu", [](const cv::Mat& g) { return segment::thresholdOtsu(g, true); }},
+        {"edge", [](const cv::Mat& g) { return segment::edgeConnect(g, true); }},
+        {"hat", [](const cv::Mat& g) { return segment::blackHatDetect(g, 15); }},
+    };
+    std::vector<std::pair<std::string, cv::Mat>> out;
+    out.reserve(3);
+    for (const auto& r : kRuns) {
+        out.emplace_back(r.tag, segment::morphologyClean(r.make(gray), 3, 5));
+    }
+    return out;
+}
+
 // Stage 2.5: run every segmentation strategy on every image listed in
 // <list.txt> (one path per line, '#' comments allowed) and write only the
 // cleaned mask to <out_dir>/<stem>_<strategy>_mask.png. Runs all images in
 // one process -- unlike the interactive `segment` command this must be fast
-// enough for hundreds of frames. Masks use the same morphologyClean(3,5)
-// post-processing as `segment`, so interactive and batch results match.
+// enough for hundreds of frames.
 int runBatch(const std::string& list_path, const std::string& out_dir) {
     std::ifstream in(list_path);
     if (!in) {
@@ -162,18 +190,9 @@ int runBatch(const std::string& list_path, const std::string& out_dir) {
         const cv::Mat gray = preprocess::toGray(img);
         const std::string stem = std::filesystem::path(path).stem().string();
 
-        struct Run {
-            const char* tag;
-            cv::Mat (*make)(const cv::Mat&);
-        } const runs[] = {
-            {"otsu", [](const cv::Mat& g) { return segment::thresholdOtsu(g, true); }},
-            {"edge", [](const cv::Mat& g) { return segment::edgeConnect(g, true); }},
-            {"hat", [](const cv::Mat& g) { return segment::blackHatDetect(g, 15); }},
-        };
-        for (const auto& r : runs) {
-            const cv::Mat cleaned =
-                segment::morphologyClean(r.make(gray), 3, 5);
-            cv::imwrite(out_dir + "/" + stem + "_" + r.tag + "_mask.png", cleaned);
+        for (const auto& r : segmentAllMasks(gray)) {
+            cv::imwrite(out_dir + "/" + stem + "_" + r.first + "_mask.png",
+                        r.second);
         }
         ++ok;
     }
@@ -183,6 +202,73 @@ int runBatch(const std::string& list_path, const std::string& out_dir) {
     std::cout << "batch done: " << ok << " processed, " << skipped
               << " skipped in " << ms << " ms\n";
     std::cout << "masks in:   " << out_dir << "\n";
+    return 0;
+}
+
+// Stage 3: one feature row per image in <list.txt>, written as CSV:
+// gray stats + GLCM texture features of the raw image, then the shape
+// of every stage-2 mask. Feature order is fixed and documented in the
+// header row, so the Python trainer never has to guess a column.
+int runFeatures(const std::string& list_path, const std::string& csv_path) {
+    std::ifstream in(list_path);
+    if (!in) {
+        std::cerr << "cannot open list file: " << list_path << "\n";
+        return 1;
+    }
+    std::ofstream csv(csv_path);
+    if (!csv) {
+        std::cerr << "cannot open csv for writing: " << csv_path << "\n";
+        return 1;
+    }
+    csv << "file,mean,std,glcm_contrast,glcm_energy,glcm_homogeneity,"
+           "glcm_correlation";
+    for (const char* tag : {"otsu", "edge", "hat"}) {
+        csv << "," << tag << "_fg," << tag << "_nreg," << tag << "_mean_area,"
+            << tag << "_max_area";
+    }
+    csv << "\n";
+    csv << std::fixed << std::setprecision(4);
+
+    const auto t0 = std::chrono::steady_clock::now();
+    int ok = 0, skipped = 0;
+    std::string line;
+    while (std::getline(in, line)) {
+        const auto first = line.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos || line[first] == '#') {
+            continue;
+        }
+        const std::string path =
+            line.substr(first, line.find_last_not_of(" \t\r\n") - first + 1);
+
+        cv::Mat img = cv::imread(path, cv::IMREAD_UNCHANGED);
+        if (img.empty()) {
+            std::cerr << "!! skip (cannot read): " << path << "\n";
+            ++skipped;
+            continue;
+        }
+        const cv::Mat gray = preprocess::toGray(img);
+        std::vector<double> feats;
+        features::appendGrayStats(gray, feats);
+        features::appendGlcm(gray, feats);
+        for (const auto& r : segmentAllMasks(gray)) {
+            features::appendMaskShape(r.second, feats);
+        }
+
+        csv << path;
+        for (const double f : feats) {
+            csv << "," << f;
+        }
+        csv << "\n";
+        if ((++ok) % 250 == 0) {
+            std::cout << "  features: " << ok << " rows\n";
+        }
+    }
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count();
+    std::cout << "features done: " << ok << " rows, " << skipped
+              << " skipped in " << ms << " ms\n";
+    std::cout << "saved: " << csv_path << "\n";
     return 0;
 }
 
@@ -262,6 +348,13 @@ int main(int argc, char** argv) {
                 return 1;
             }
             return runBatch(argv[2], argv[3]);
+        }
+        if (cmd == "features") {
+            if (argc != 4) {
+                usage(argv[0]);
+                return 1;
+            }
+            return runFeatures(argv[2], argv[3]);
         }
         // legacy / "gray" mode: <in> <out.png>
         if (argc != 3) {
