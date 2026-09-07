@@ -13,6 +13,11 @@
 //        feature vector (gray stats + GLCM texture + mask shapes), one CSV
 //        row each. Training/judging lives in Python (scripts/train_classify.py);
 //        the C++ side stays a reusable feature pipeline.
+//   defect_detector patchfeat <list.txt> <out.csv>     -- stage4: same
+//        feature vector, but for one rectangular PATCH per line
+//        "<img> x0 y0 x1 y1" (0-based, clamped to the image). Box-level
+//        detection: GT boxes and candidate boxes are all judged through
+//        this single path, so train and inference see identical features.
 //
 // Stage-1 chain (why this order matters):
 //   1) toGray     -- NEU images are 3-channel JPEG but semantically gray
@@ -30,6 +35,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -56,7 +62,8 @@ void usage(const char* argv0) {
               << "  " << argv0 << " segment    <input_image> <out_prefix> "
                  "[otsu|edge|hat|all]\n"
               << "  " << argv0 << " batch      <image_list.txt> <out_dir>\n"
-              << "  " << argv0 << " features   <image_list.txt> <out.csv>\n";
+              << "  " << argv0 << " features   <image_list.txt> <out.csv>\n"
+              << "  " << argv0 << " patchfeat  <patch_list.txt> <out.csv>\n";
 }
 
 // min / mean / max / std of an 8-bit gray image -- numeric evidence that a
@@ -272,6 +279,83 @@ int runFeatures(const std::string& list_path, const std::string& csv_path) {
     return 0;
 }
 
+// Stage 4: box-level feature extraction. Each list line is
+// "<img_path> x0 y0 x1 y1" (0-based). The patch is cut (clamped to the
+// image), converted to gray and fed through the SAME feature groups and
+// the SAME stage-2 strategies as whole images, so a GT box patch and a
+// candidate box patch are described identically. Rows carry the box
+// coordinates so the Python side can join them back to boxes/labels.
+int runPatchFeat(const std::string& list_path, const std::string& csv_path) {
+    std::ifstream in(list_path);
+    if (!in) {
+        std::cerr << "cannot open list file: " << list_path << "\n";
+        return 1;
+    }
+    std::ofstream csv(csv_path);
+    if (!csv) {
+        std::cerr << "cannot open csv for writing: " << csv_path << "\n";
+        return 1;
+    }
+    csv << "file,x0,y0,x1,y1,mean,std,glcm_contrast,glcm_energy,"
+           "glcm_homogeneity,glcm_correlation";
+    for (const char* tag : {"otsu", "edge", "hat"}) {
+        csv << "," << tag << "_fg," << tag << "_nreg," << tag << "_mean_area,"
+            << tag << "_max_area";
+    }
+    csv << "\n";
+    csv << std::fixed << std::setprecision(4);
+
+    const auto t0 = std::chrono::steady_clock::now();
+    int ok = 0, skipped = 0;
+    std::string line;
+    while (std::getline(in, line)) {
+        std::istringstream ls(line);
+        std::string path;
+        int x0, y0, x1, y1;
+        if (!(ls >> path >> x0 >> y0 >> x1 >> y1) || path.empty() ||
+            path[0] == '#') {
+            continue;
+        }
+        cv::Mat img = cv::imread(path, cv::IMREAD_UNCHANGED);
+        if (img.empty()) {
+            std::cerr << "!! skip (cannot read): " << path << "\n";
+            ++skipped;
+            continue;
+        }
+        // clamp the box into the image, reject empty patches
+        x0 = std::max(0, std::min(x0, img.cols - 1));
+        y0 = std::max(0, std::min(y0, img.rows - 1));
+        x1 = std::max(0, std::min(x1, img.cols - 1));
+        y1 = std::max(0, std::min(y1, img.rows - 1));
+        if (x1 - x0 < 4 || y1 - y0 < 4) {
+            ++skipped;
+            continue;
+        }
+        const cv::Mat gray =
+            preprocess::toGray(img(cv::Rect(x0, y0, x1 - x0, y1 - y0)));
+
+        std::vector<double> feats;
+        features::appendGrayStats(gray, feats);
+        features::appendGlcm(gray, feats);
+        for (const auto& r : segmentAllMasks(gray)) {
+            features::appendMaskShape(r.second, feats);
+        }
+        csv << path << "," << x0 << "," << y0 << "," << x1 << "," << y1;
+        for (const double f : feats) {
+            csv << "," << f;
+        }
+        csv << "\n";
+        ++ok;
+    }
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count();
+    std::cout << "patchfeat done: " << ok << " patches, " << skipped
+              << " skipped in " << ms << " ms\n";
+    std::cout << "saved: " << csv_path << "\n";
+    return 0;
+}
+
 // Stage 1: gray -> median denoise -> global / CLAHE equalization.
 // Returns 0 on success.
 int runPreprocess(const std::string& in_path, const std::string& prefix) {
@@ -355,6 +439,13 @@ int main(int argc, char** argv) {
                 return 1;
             }
             return runFeatures(argv[2], argv[3]);
+        }
+        if (cmd == "patchfeat") {
+            if (argc != 4) {
+                usage(argv[0]);
+                return 1;
+            }
+            return runPatchFeat(argv[2], argv[3]);
         }
         // legacy / "gray" mode: <in> <out.png>
         if (argc != 3) {
