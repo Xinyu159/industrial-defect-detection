@@ -51,21 +51,25 @@ def code_of(xml_path):
     return CODE.get(name, name[:2].upper())
 
 
-def tile(gray, text, draw_boxes=None, color=GREEN):
-    """200x200 gray tile + 24px label strip, optional green boxes."""
-    h, w = gray.shape
+def tile(img, text, draw_boxes=None, color=GREEN):
+    """Tile = 24px label strip + image below, optional green boxes drawn on
+    top of the image (never on an empty white canvas)."""
+    if img.ndim == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    h, w = img.shape[:2]
     out = np.full((STRIP + h, w, 3), 255, np.uint8)
+    out[STRIP:] = img  # the image content FIRST
     if draw_boxes:
         for b in draw_boxes:
             cv2.rectangle(out[STRIP:], (b[0], b[1]), (b[2], b[3]), color, 2)
-    else:
-        out[STRIP:] = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
     cv2.putText(out, text, (4, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (30, 30, 30), 1)
     return out
 
 
 def load_optional(path):
-    img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+    # IMREAD_COLOR: overlays carry green contours -- reading grayscale
+    # would silently discard the very color we want to compare.
+    img = cv2.imread(str(path), cv2.IMREAD_COLOR)
     return img if img is not None else None
 
 
