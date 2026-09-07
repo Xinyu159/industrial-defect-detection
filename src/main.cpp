@@ -3,6 +3,12 @@
 // Commands:
 //   defect_detector gray       <in> <out.png>          -- stage0: gray only
 //   defect_detector preprocess <in> <out_prefix>       -- stage1: full chain
+//   defect_detector segment    <in> <out_prefix> [strategy]
+//   defect_detector batch      <list.txt> <out_dir>    -- stage2.5: one image
+//        per line, all strategies, masks only. Evaluation against the XML
+//        ground truth lives in scripts/batch_hitrate.py -- the C++ core only
+//        produces masks, a separate validation tool judges them. A single
+//        image that fails to load is skipped, the rest still runs.
 //
 // Stage-1 chain (why this order matters):
 //   1) toGray     -- NEU images are 3-channel JPEG but semantically gray
@@ -15,6 +21,9 @@
 // numerically, not just by eye.
 
 #include <algorithm>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -38,7 +47,8 @@ void usage(const char* argv0) {
               << "  " << argv0 << " gray       <input_image> <output_image>\n"
               << "  " << argv0 << " preprocess <input_image> <out_prefix>\n"
               << "  " << argv0 << " segment    <input_image> <out_prefix> "
-                 "[otsu|edge|hat|all]\n";
+                 "[otsu|edge|hat|all]\n"
+              << "  " << argv0 << " batch      <image_list.txt> <out_dir>\n";
 }
 
 // min / mean / max / std of an 8-bit gray image -- numeric evidence that a
@@ -117,6 +127,65 @@ int runSegment(const std::string& in_path, const std::string& prefix,
     return 0;
 }
 
+// Stage 2.5: run every segmentation strategy on every image listed in
+// <list.txt> (one path per line, '#' comments allowed) and write only the
+// cleaned mask to <out_dir>/<stem>_<strategy>_mask.png. Runs all images in
+// one process -- unlike the interactive `segment` command this must be fast
+// enough for hundreds of frames. Masks use the same morphologyClean(3,5)
+// post-processing as `segment`, so interactive and batch results match.
+int runBatch(const std::string& list_path, const std::string& out_dir) {
+    std::ifstream in(list_path);
+    if (!in) {
+        std::cerr << "cannot open list file: " << list_path << "\n";
+        return 1;
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(out_dir, ec);
+
+    int ok = 0, skipped = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    std::string line;
+    while (std::getline(in, line)) {
+        // trim surrounding whitespace
+        const auto first = line.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos || line[first] == '#') {
+            continue;
+        }
+        const std::string path = line.substr(first, line.find_last_not_of(" \t\r\n") - first + 1);
+
+        cv::Mat img = cv::imread(path, cv::IMREAD_UNCHANGED);
+        if (img.empty()) {
+            std::cerr << "!! skip (cannot read): " << path << "\n";
+            ++skipped;
+            continue;
+        }
+        const cv::Mat gray = preprocess::toGray(img);
+        const std::string stem = std::filesystem::path(path).stem().string();
+
+        struct Run {
+            const char* tag;
+            cv::Mat (*make)(const cv::Mat&);
+        } const runs[] = {
+            {"otsu", [](const cv::Mat& g) { return segment::thresholdOtsu(g, true); }},
+            {"edge", [](const cv::Mat& g) { return segment::edgeConnect(g, true); }},
+            {"hat", [](const cv::Mat& g) { return segment::blackHatDetect(g, 15); }},
+        };
+        for (const auto& r : runs) {
+            const cv::Mat cleaned =
+                segment::morphologyClean(r.make(gray), 3, 5);
+            cv::imwrite(out_dir + "/" + stem + "_" + r.tag + "_mask.png", cleaned);
+        }
+        ++ok;
+    }
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count();
+    std::cout << "batch done: " << ok << " processed, " << skipped
+              << " skipped in " << ms << " ms\n";
+    std::cout << "masks in:   " << out_dir << "\n";
+    return 0;
+}
+
 // Stage 1: gray -> median denoise -> global / CLAHE equalization.
 // Returns 0 on success.
 int runPreprocess(const std::string& in_path, const std::string& prefix) {
@@ -186,6 +255,13 @@ int main(int argc, char** argv) {
                 return 1;
             }
             return runPreprocess(argv[2], argv[3]);
+        }
+        if (cmd == "batch") {
+            if (argc != 4) {
+                usage(argv[0]);
+                return 1;
+            }
+            return runBatch(argv[2], argv[3]);
         }
         // legacy / "gray" mode: <in> <out.png>
         if (argc != 3) {
