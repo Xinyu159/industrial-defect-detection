@@ -2,19 +2,20 @@
 """Visual check of the stage-3 classifier -- NUMBERS ARE NOT EVIDENCE.
 
 Re-trains the same SVM with the same split as train_classify.py and
-renders ONE image with:
-  - every test image the model got WRONG, labeled  GT -> predicted
-  - 5 correct samples per class
+renders ONE page laid out the way a compare sheet should be:
+    TOP    = every test image the model got WRONG, one row per sample:
+             [ truth: GT class, green boxes ] [ model: predicted class ]
+    BOTTOM = correct samples per class (GT = prediction)
 
-so a human can eyeball whether the 96.9% is real. Mislabeling here is
-usually the defect itself being ambiguous (the GT class still shows in
-the image), not the model being broken.
+so a human can eyeball whether the 96.9% is real: look at the boxed
+defect on the left and judge if the right-hand label is fair.
 
 Usage (from the repo root):
     python scripts/visualize_preds.py [--test-size 0.2] [--seed 20260907]
 """
 import argparse
 import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import cv2
@@ -24,12 +25,31 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import train_classify as tc  # reuse load_rows / split / train exactly
 
 OUT = tc.OUT
-TILE = 200
+ROOT = Path(__file__).resolve().parent.parent
+ANNS = ROOT / "data" / "NEU-DET" / "ANNOTATIONS"
+TILE = 250  # upscaled so defects are actually visible
 STRIP = 26
 GAP = 6
 OK_GREEN = (60, 200, 60)
 BAD_RED = (70, 70, 235)
+BOX_GREEN = (0, 230, 0)
 CODES = [c for _, c, _ in tc.CLASSES]
+
+
+def gt_boxes(stem):
+    """VOC boxes of one image, scaled to TILE px (0-based)."""
+    xml = ANNS / f"{stem}.xml"
+    if not xml.exists():
+        return []
+    root = ET.parse(xml).getroot()
+    s = TILE / 200.0
+    out = []
+    for o in root.findall("object"):
+        bb = o.find("bndbox")
+        x0, y0 = int(bb.findtext("xmin")) - 1, int(bb.findtext("ymin")) - 1
+        x1, y1 = int(bb.findtext("xmax")), int(bb.findtext("ymax"))
+        out.append((int(x0 * s), int(y0 * s), int(x1 * s), int(y1 * s)))
+    return out
 
 
 def draw_text(img, s, org, scale=0.5, fill=(255, 255, 255)):
@@ -40,12 +60,19 @@ def draw_text(img, s, org, scale=0.5, fill=(255, 255, 255)):
                 1, cv2.LINE_AA)
 
 
-def tile(img_path, text, ok):
+def tile(img_path, text, color, boxed):
+    """Upscaled original + label strip; GT truth gets green boxes, the
+    model's view stays box-free so the human compares honestly."""
     bgr = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
+    if bgr is None:
+        bgr = np.full((200, 200, 3), 200, np.uint8)
+    bgr = cv2.resize(bgr, (TILE, TILE), interpolation=cv2.INTER_CUBIC)
+    if boxed:
+        for (x0, y0, x1, y1) in gt_boxes(Path(img_path).stem):
+            cv2.rectangle(bgr, (x0, y0), (x1, y1), BOX_GREEN, 1)
     out = np.full((STRIP + TILE, TILE, 3), 25, np.uint8)
-    if bgr is not None:
-        out[STRIP:] = cv2.resize(bgr, (TILE, TILE))
-    draw_text(out, text, (4, 18), 0.5, OK_GREEN if ok else BAD_RED)
+    out[STRIP:] = bgr
+    draw_text(out, text, (4, 18), 0.5, color)
     return out
 
 
@@ -62,14 +89,9 @@ def pad_row(row, w):
     return row
 
 
-def row_of(cells):
-    """hstack cells with GAP between them, no trailing gap -> a row of n
-    cells is n*TILE + (n-1)*GAP wide, matching the title bars."""
-    row = cells[0]
-    for c in cells[1:]:
-        gap = np.full((c.shape[0], GAP, 3), 25, np.uint8)
-        row = np.hstack([row, gap, c])
-    return row
+def hstack_gap(left, right):
+    gap = np.full((left.shape[0], GAP, 3), 25, np.uint8)
+    return np.hstack([left, gap, right])
 
 
 def main():
@@ -91,20 +113,31 @@ def main():
     for i, fpath, gt, pr in wrong:
         print(f"  {gt} -> {pr}   {Path(fpath).stem}.jpg")
 
-    # Build the page: title bars and tile rows, in order. Short rows are
-    # padded right afterwards, so page width = widest content row.
-    blocks = [("t", f"wrong ({len(wrong)} of {len(tei)}) -- "
-                   "GT -> predicted, check by eye")]
-    for k in range(0, len(wrong), 6):
-        cells = [tile(f, f"GT {gt} -> {pr}", ok=False)
-                 for i, f, gt, pr in wrong[k:k + 6]]
-        blocks.append(("r", row_of(cells)))
-    blocks.append(("t", f"correct samples, {args.correct_per_class} per class "
-                        "(green = agrees with the XML ground truth)"))
+    legend = ("codes: Cr=crazing | In=inclusion | Pa=patches | PS=pitted | "
+              "RS=rolled-in | Sc=scratches")
+
+    # --- TOP: wrong samples, one row each: [GT truth] [model prediction]
+    blocks = [("t", legend),
+              ("t", f"WRONG ({len(wrong)} of {len(tei)} test images) -- "
+                    f"left = truth (green box)  right = what the model said")]
+    for i, fpath, gt, pr in wrong:
+        gt_tile = tile(fpath, f"truth: {gt}", OK_GREEN, boxed=True)
+        pr_tile = tile(fpath, f"model: {pr}", BAD_RED, boxed=False)
+        blocks.append(("r", hstack_gap(gt_tile, pr_tile)))
+
+    # --- BOTTOM: correct samples per class, GT == prediction
+    blocks.append(("t", f"CORRECT -- {args.correct_per_class} per class, "
+                        "truth == prediction (green)"))
     for code in CODES:
         got = [tei[j] for j in range(len(tei))
                if y[tei[j]] == code and pred[j] == code][:args.correct_per_class]
-        blocks.append(("r", row_of([tile(files[k], code, ok=True) for k in got])))
+        cells = [tile(files[k], f"{code} ok", OK_GREEN, boxed=True)
+                 for k in got]
+        for k in range(0, len(cells), 5):
+            row = cells[k]
+            for c in cells[k + 1:k + 5]:
+                row = hstack_gap(row, c)
+            blocks.append(("r", row))
 
     maxw = max(b[1].shape[1] for b in blocks if b[0] == "r")
     pieces = []
