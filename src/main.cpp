@@ -22,8 +22,11 @@
 #include <opencv2/core.hpp>
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgcodecs.hpp>
+#include <opencv2/imgproc.hpp>
 
 #include "preprocess.h"
+#include "segmentation.h"
+#include "visualize.h"
 
 namespace {
 
@@ -33,7 +36,9 @@ const std::vector<std::string> kSupportedExts = {
 void usage(const char* argv0) {
     std::cerr << "usage:\n"
               << "  " << argv0 << " gray       <input_image> <output_image>\n"
-              << "  " << argv0 << " preprocess <input_image> <out_prefix>\n";
+              << "  " << argv0 << " preprocess <input_image> <out_prefix>\n"
+              << "  " << argv0 << " segment    <input_image> <out_prefix> "
+                 "[otsu|edge|hat|all]\n";
 }
 
 // min / mean / max / std of an 8-bit gray image -- numeric evidence that a
@@ -45,6 +50,71 @@ void reportStats(const char* tag, const cv::Mat& gray) {
     cv::minMaxLoc(gray, &mn, &mx);
     std::cout << "  " << tag << ": min=" << (int)mn << " mean=" << mean[0]
               << " max=" << (int)mx << " std=" << stddev[0] << "\n";
+}
+
+// Run one segmentation strategy on an image, save mask + overlay + a
+// component-color view, and report region stats so results can be judged
+// numerically before moving on (HDevelop-style "drag & look" loop).
+void runOneStrategy(const std::string& tag, const cv::Mat& gray,
+                    const cv::Mat& mask, const std::string& prefix) {
+    cv::Mat cleaned = segment::morphologyClean(mask, 3, 5);
+    cv::imwrite(prefix + "_" + tag + "_mask.png", cleaned);
+
+    cv::Mat overlay = visualize::overlayMask(gray, cleaned);
+    cv::imwrite(prefix + "_" + tag + "_overlay.png", overlay);
+
+    cv::Mat colored = visualize::colorizeComponents(cleaned);
+    cv::imwrite(prefix + "_" + tag + "_components.png", colored);
+
+    cv::Mat labels, stats, centroids;
+    const int n =
+        cv::connectedComponentsWithStats(cleaned, labels, stats, centroids, 8);
+    const double fgShare =
+        100.0 * cv::countNonZero(cleaned) / (double)cleaned.total();
+    std::cout << "  [" << tag << "] fg=" << fgShare << "% regions=" << n - 1;
+    if (n > 1) {
+        std::vector<int> areas;
+        for (int i = 1; i < n; ++i) {
+            areas.push_back(stats.at<int>(i, cv::CC_STAT_AREA));
+        }
+        std::sort(areas.begin(), areas.end(), std::greater<int>());
+        std::cout << " top areas=";
+        const size_t k = std::min<size_t>(3, areas.size());
+        for (size_t i = 0; i < k; ++i) {
+            std::cout << areas[i] << (i + 1 < k ? "," : "");
+        }
+    }
+    std::cout << "\n";
+}
+
+// Stage 2: try the three strategies on one image; each exploits a different
+// separability dimension, then morphologyClean tidies the mask up.
+int runSegment(const std::string& in_path, const std::string& prefix,
+               const std::string& which) {
+    cv::Mat img = cv::imread(in_path, cv::IMREAD_UNCHANGED);
+    if (img.empty()) {
+        std::cerr << "failed to read image: " << in_path << "\n";
+        return 1;
+    }
+    const cv::Mat gray = preprocess::toGray(img);
+    std::cout << "segment " << in_path << "\n";
+
+    const bool all = (which == "all");
+    if (all || which == "otsu") {
+        cv::Mat m = segment::thresholdOtsu(gray, /*defectsAreDark=*/true);
+        runOneStrategy("otsu", gray, m, prefix);
+    }
+    if (all || which == "edge") {
+        cv::Mat m = segment::edgeConnect(gray, /*enhanceFirst=*/true);
+        runOneStrategy("edge", gray, m, prefix);
+    }
+    if (all || which == "hat") {
+        cv::Mat m = segment::blackHatDetect(gray, 15);
+        runOneStrategy("hat", gray, m, prefix);
+    }
+    std::cout << "saved: " << prefix
+              << "_{otsu,edge,hat}_{mask,overlay,components}.png\n";
+    return 0;
 }
 
 // Stage 1: gray -> median denoise -> global / CLAHE equalization.
@@ -105,6 +175,11 @@ int main(int argc, char** argv) {
             return 1;
         }
         const std::string cmd = argv[1];
+        if (cmd == "segment") {
+            const std::string which =
+                (argc == 5) ? argv[4] : std::string("all");
+            return runSegment(argv[2], argv[3], which);
+        }
         if (cmd == "preprocess") {
             if (argc != 4) {
                 usage(argv[0]);

@@ -13,6 +13,8 @@ find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs)
 add_executable(defect_detector
     src/main.cpp
     src/preprocess.cpp
+    src/segmentation.cpp
+    src/visualize.cpp
 )
 
 target_include_directories(defect_detector PRIVATE include)
