@@ -1,0 +1,19 @@
+# ---- build artifacts ----
+build/
+*.o
+*.obj
+*.exe
+compile_commands.json
+
+# ---- dataset: large, keep out of repo (README gives download link) ----
+data/
+
+# ---- outputs ----
+results/
+*.log
+
+# ---- IDE / OS ----
+.vscode/
+.idea/
+.DS_Store
+*.swp
